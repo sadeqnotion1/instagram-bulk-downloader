@@ -21,3 +21,10 @@
 - Fixed inline comments in `.gitignore` that prevented `state/` and `config.json` patterns from matching correctly.
 - Initialized Git repository, staged appropriate files, and made the initial commit.
 - Set up remote origin pointing to `https://github.com/sadeqnotion1/instagram-bulk-downloader` and pushed branch `main` to `origin`.
+
+## 2026-06-26 - session handling & rate limit robust fix
+- Backed up the repository to a timestamped ZIP in the parent directory.
+- Overwrote `app/igclient.py` with the persistent device + session reuse fix.
+- Deleted the outdated session file `sessions/sadster710.json` to force a clean, persistent device setup.
+- Verified that `py_compile app/igclient.py` and `app.main --help` both succeed without errors.
+- Committed and pushed the `app/igclient.py` fix to `origin/main`.
