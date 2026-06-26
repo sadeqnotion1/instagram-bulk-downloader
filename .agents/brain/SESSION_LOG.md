@@ -16,3 +16,8 @@
   login resolution flags > env > config > prompt; saves memory after each run.
 - Updated README / START_HERE / .gitignore (config.json + state/ ignored).
 - Re-verified py_compile + --help; live run still pending.
+
+## 2026-06-26 - git repo initialization & initial push
+- Fixed inline comments in `.gitignore` that prevented `state/` and `config.json` patterns from matching correctly.
+- Initialized Git repository, staged appropriate files, and made the initial commit.
+- Set up remote origin pointing to `https://github.com/sadeqnotion1/instagram-bulk-downloader` and pushed branch `main` to `origin`.
