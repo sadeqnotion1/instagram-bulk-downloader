@@ -1,8 +1,8 @@
-"""Instagram login + resilient, incremental \"download posts\" logic.
+"""Instagram login + resilient, incremental "download posts" logic.
 
 Logs in (reusing a cached session when possible) and pages through a target
 profile's media list, downloading each page as it arrives into
-``<out>/@<username>/posts_<username>_<date>_<time>/``.
+`` /@ /posts_ _ _ /``.
 
 Two behaviours worth knowing:
 
@@ -14,10 +14,18 @@ Two behaviours worth knowing:
   the same cursor, so a full profile can be fetched in one run.
 
 No bot, no scheduler - it is driven only by an explicit call from the CLI.
+
+Session strategy (the part that keeps you logged in and looks human):
+* Reuse the saved session silently when it still works.
+* A TRANSIENT error (throttle / network) during validation KEEPS the session
+  and carries on - it must never trigger a re-login.
+* Only a genuine "logged out" re-authenticates, and even then it REUSES the
+  saved device fingerprint (uuids) so Instagram never sees a new device.
 """
 from __future__ import annotations
 
 import logging
+import random
 import time
 from pathlib import Path
 
@@ -26,14 +34,19 @@ from app.media import download_one
 log = logging.getLogger("ig")
 
 # --- pacing / resilience knobs (tune to taste) ------------------------------
-PAGE_SIZE = 50        # media per listing request (Instagram caps ~50)
-PAGE_DELAY = 3.0      # seconds between successful listing pages
-RETRY_WAIT = 300      # base seconds to wait after a rate limit (x retry number)
-MAX_RETRIES = 3       # rate-limit retries per stall (resets after a good page)
-WAIT_TICK = 15        # how often (s) to refresh the wait countdown
-REQUEST_TIMEOUT = 20  # seconds for API + media/CDN downloads (instagrapi default is 1!)
-DOWNLOAD_RETRIES = 3  # attempts per media item on transient download errors
-DOWNLOAD_RETRY_WAIT = 5  # seconds between download retries
+PAGE_SIZE = 50          # media per listing request (Instagram caps ~50)
+PAGE_DELAY_MIN = 4.0    # min seconds between successful pages (jittered)
+PAGE_DELAY_MAX = 12.0   # max seconds between successful pages (jittered)
+LONG_PAUSE_EVERY = 5    # every N pages, take a longer human-like breather (0 = off)
+LONG_PAUSE_MIN = 30.0   # min seconds for the periodic long pause
+LONG_PAUSE_MAX = 90.0   # max seconds for the periodic long pause
+RETRY_WAIT = 300        # base seconds to wait after a rate limit (x retry number)
+MAX_RETRIES = 3         # rate-limit retries per stall (resets after a good page)
+WAIT_TICK = 15          # how often (s) to refresh the wait countdown
+REQUEST_TIMEOUT = 20    # seconds for API + media/CDN downloads (instagrapi default is 1!)
+DOWNLOAD_RETRIES = 3    # attempts per media item on transient download errors
+DOWNLOAD_RETRY_WAIT = 5 # seconds between download retries
+DEFAULT_DELAY_RANGE = (3, 9)  # instagrapi inter-request delay (wider = more human)
 
 
 def _is_rate_limit(err):
@@ -48,6 +61,38 @@ def _is_rate_limit(err):
         or "try again" in msg
         or "429" in msg
         or "too many" in msg
+    )
+
+
+def _needs_2fa(err):
+    """True if the login error is asking for a 2FA code."""
+    name = type(err).__name__.lower()
+    msg = str(err).lower()
+    return (
+        "twofactor" in name
+        or "two_factor" in name
+        or "two-factor" in msg
+        or "two factor" in msg
+        or "verification_code" in msg
+        or "2fa" in msg
+    )
+
+
+def _is_login_required(err):
+    """True ONLY for a genuine 'you are logged out' error (never a throttle).
+
+    This is the only condition under which we actually re-authenticate. A
+    transient throttle or network blip must NOT trigger a fresh login - that
+    is exactly what was getting the account flagged.
+    """
+    name = type(err).__name__.lower()
+    msg = str(err).lower()
+    return (
+        "loginrequired" in name
+        or "login_required" in msg
+        or "logged out" in msg
+        or ("login" in msg and "required" in msg)
+        or "csrf" in msg
     )
 
 
@@ -79,13 +124,14 @@ def _post_folder(target, media):
 class InstagramArchiver:
     """Thin wrapper around instagrapi for one-profile bulk downloads."""
 
-    def __init__(self, session_path, delay_range=(2, 5)):
+    def __init__(self, session_path, delay_range=DEFAULT_DELAY_RANGE):
         # Import lazily so `--help` works without instagrapi installed.
         from instagrapi import Client
 
         self.session_path = Path(session_path)
+        self.delay_range = list(delay_range)
         self.cl = Client()
-        self.cl.delay_range = list(delay_range)
+        self.cl.delay_range = list(self.delay_range)
         self.cl.request_timeout = REQUEST_TIMEOUT
 
     # -- auth ----------------------------------------------------------------
@@ -103,52 +149,84 @@ class InstagramArchiver:
             log.warning(f"could not generate TOTP code from seed: {e}")
             return ""
 
+    def _reset_keeping_device(self):
+        """Drop the session/auth but KEEP the device fingerprint (uuids).
+
+        A re-login then looks like the SAME phone, not a brand-new device -
+        which is the single biggest thing that was tripping Instagram.
+        """
+        from instagrapi import Client
+
+        settings = self.cl.get_settings()
+        self.cl = Client()
+        # Restore device + uuids so the fingerprint is stable across re-logins.
+        try:
+            self.cl.set_settings(settings)
+            self.cl.set_uuids(settings.get("uuids", {}))
+        except Exception as e:
+            log.warning(f"could not fully restore device settings: {e}")
+        # Clear only the auth/session bits so login() does a clean re-auth.
+        self.cl.authorization_data = {}
+        try:
+            self.cl.private.cookies.clear()
+        except Exception:
+            pass
+        self.cl.delay_range = list(self.delay_range)
+        self.cl.request_timeout = REQUEST_TIMEOUT
+
     def login(self, username, password="", verification_code="", totp_seed="",
               on_need_2fa=None, on_need_password=None):
-        """Log in, reusing a saved session when valid, handling 2FA on demand.
+        """Log in, reusing a saved session+device when possible.
+
+        Order of events:
+        1) Load saved settings (device + session) if present.
+        2) Try to reuse the session silently. On a transient error KEEP the
+           session and continue; only a real LoginRequired re-authenticates,
+           and it reuses the saved device.
+        3) Fresh login (first run / expired), retrying once with 2FA.
 
         2FA code precedence: saved totp_seed -> verification_code ->
         on_need_2fa() callback (prompts you for the current code).
         """
-        def _needs_2fa(err):
-            name = type(err).__name__.lower()
-            msg = str(err).lower()
-            return (
-                "twofactor" in name
-                or "two_factor" in name
-                or "two-factor" in msg
-                or "two factor" in msg
-                or "verification_code" in msg
-                or "2fa" in msg
-            )
+        from instagrapi import Client
 
-        # 1) Try an existing session first - usually no password/2FA needed.
+        # 1) Load saved settings (device + session) if we have them.
+        have_settings = False
         if self.session_path.exists():
-            session_loaded = False
             try:
                 self.cl.load_settings(self.session_path)
+                self.cl.delay_range = list(self.delay_range)
                 self.cl.request_timeout = REQUEST_TIMEOUT
-                session_loaded = True
+                have_settings = True
+            except Exception as e:
+                log.warning(f"could not read session file ({e}); starting clean.")
+
+        # 2) If we have a session, try to reuse it silently.
+        if have_settings:
+            try:
                 self.cl.get_timeline_feed()  # validate the session
-                log.info("reused saved session.")
+                log.info("reused saved session (no re-login needed).")
                 self._save_session()
                 return True
             except Exception as e:
-                log.warning(f"saved session invalid ({e}); logging in fresh.")
-                if not session_loaded:
-                    from instagrapi import Client  # lazy: only needed to reset
-                    self.cl = Client()
-                    self.cl.delay_range = [2, 5]
-                    self.cl.request_timeout = REQUEST_TIMEOUT
-                else:
-                    # Keep the loaded device profile but clear session data
-                    try:
-                        self.cl.set_cookies({})
-                    except Exception:
-                        pass
-                    self.cl.authorization_data = {}
+                if _is_rate_limit(e):
+                    # Transient throttle -> DO NOT relogin (that is what was
+                    # triggering challenges). Keep the session and proceed.
+                    log.warning(
+                        f"session check throttled ({e}); keeping session and continuing."
+                    )
+                    return True
+                if not _is_login_required(e):
+                    # Network / other transient -> keep session, proceed.
+                    log.warning(
+                        f"session check failed transiently ({e}); keeping session and continuing."
+                    )
+                    return True
+                # Genuinely logged out -> re-auth, but REUSE the device.
+                log.info("saved session expired; re-authenticating on the SAME device.")
+                self._reset_keeping_device()
 
-        # 2) Fresh login: prompt for password if not provided
+        # 3) Fresh login (first run, or expired session). Reuses device if any.
         active_password = password
         if not active_password and on_need_password is not None:
             active_password = on_need_password()
@@ -158,7 +236,6 @@ class InstagramArchiver:
         # A code to try on the first attempt (seed wins, else any passed code).
         first_code = self._totp_code(totp_seed) or verification_code
 
-        # 3) Fresh login, retrying once with a 2FA code if required.
         try:
             self.cl.login(username, active_password, verification_code=first_code)
         except Exception as e:
@@ -183,7 +260,7 @@ class InstagramArchiver:
             if p.is_dir() and p.name.startswith(prefix):
                 stamp = p.name[len(prefix):]
                 new_dir = user_dir / stamp
-                
+
                 # Check for collision
                 if new_dir.exists():
                     # Move all files from old dir to new dir
@@ -206,7 +283,7 @@ class InstagramArchiver:
                         p.rename(new_dir)
                     except Exception:
                         pass
-                
+
         # Now rename any files inside the new directories that still have the old username_ prefix or start with an extra "_"
         for p in user_dir.iterdir():
             if p.is_dir() and not p.name.startswith("posts_"):
@@ -218,7 +295,7 @@ class InstagramArchiver:
                             new_name = f.name[1:]
                         else:
                             continue
-                        
+
                         dest = f.parent / new_name
                         if dest.exists():
                             try:
@@ -233,7 +310,7 @@ class InstagramArchiver:
 
     # -- bulk / incremental download ----------------------------------------
     def download_all(self, target, out_dir, limit=0, on_status=None, since_ts=0.0):
-        """Download posts of `target` into out_dir/@<target>/posts_<...>/.
+        """Download posts of `target` into out_dir/@ /posts_<...>/.
 
         If `since_ts` > 0, only posts strictly newer than it are downloaded
         (incremental mode). Returns a summary dict including `newest_ts`, the
@@ -297,8 +374,8 @@ class InstagramArchiver:
                         step = WAIT_TICK if remaining > WAIT_TICK else remaining
                         time.sleep(step)
                         waited += step
-                    page_no -= 1   # the retry is not a new page
-                    continue        # retry the same cursor
+                    page_no -= 1  # the retry is not a new page
+                    continue  # retry the same cursor
                 stopped_early = True
                 status(f"listing stopped after {fetched} item(s): {e}")
                 break
@@ -345,8 +422,8 @@ class InstagramArchiver:
                             failed.append(str(pk))
                 if saved is not None:
                     files.extend(saved)
-                    if ts > newest_ts:
-                        newest_ts = ts
+                if ts > newest_ts:
+                    newest_ts = ts
 
             if limit and fetched >= limit:
                 status(f"reached limit of {limit}.")
@@ -358,7 +435,12 @@ class InstagramArchiver:
                 break
             if not end_cursor:
                 break
-            time.sleep(PAGE_DELAY)  # pace pagination to avoid rate limits
+            # Pace pagination with a jittered delay so the cadence isn't robotic.
+            time.sleep(random.uniform(PAGE_DELAY_MIN, PAGE_DELAY_MAX))
+            # Every few pages, take a longer human-like breather.
+            if LONG_PAUSE_EVERY and page_no % LONG_PAUSE_EVERY == 0:
+                status("taking a short break to stay under Instagram's radar ...")
+                time.sleep(random.uniform(LONG_PAUSE_MIN, LONG_PAUSE_MAX))
 
         if stopped_early:
             status(
