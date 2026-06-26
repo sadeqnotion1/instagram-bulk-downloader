@@ -1,0 +1,4 @@
+# Core dependency: the Instagram private API client.
+instagrapi>=2.0.0
+# instagrapi needs Pillow for image handling.
+pillow>=9.0.0

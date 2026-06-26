@@ -1,0 +1,22 @@
+# runtime / build
+logs/
+*.log
+__pycache__/
+dist/
+build/
+
+# secrets / local state (keep out of git)
+.env
+*.env
+# saved login (plaintext) - never commit
+config.json
+sessions/
+*.session
+# per-profile download memory
+state/
+
+# downloaded media (your archive output)
+downloads/
+
+# local backups this workflow creates
+*-backup-*.zip
